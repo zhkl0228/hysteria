@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -84,7 +85,44 @@ type serverConfig struct {
 	UserOutbounds         []serverConfigUserOutbound  `mapstructure:"userOutbounds"`
 	TrafficStats          serverConfigTrafficStats    `mapstructure:"trafficStats"`
 	Masquerade            serverConfigMasquerade      `mapstructure:"masquerade"`
+	ECH                   serverConfigECH             `mapstructure:"ech"`
+
+	// echConfigList / echPublicName hold the ECH config derived in
+	// fillECHConfig, so fillTrafficLogger can expose them via the /ech endpoint.
+	echConfigList string
+	echPublicName string
+
+	// configDir is the directory of the loaded config file, used as the
+	// default location for the persisted ECH key (echPersistFile).
+	configDir string
 }
+
+// serverConfigECH configures Encrypted Client Hello. The key pair is derived
+// deterministically from Seed, so nothing needs to be persisted: the same seed
+// always produces the same keys. Seed defaults to trafficStats.secret and
+// PublicName defaults to the first ACME domain (or TLS SNI), keeping config
+// minimal.
+type serverConfigECH struct {
+	// Disable turns ECH off. ECH is enabled by default.
+	Disable bool   `mapstructure:"disable"`
+	Seed    string `mapstructure:"seed"`
+	// PublicName is the outer (cover) SNI shown to on-path observers. It should
+	// be an innocuous domain different from the real domain so the real SNI
+	// stays hidden. When unset, defaultECHPublicName is used.
+	PublicName string `mapstructure:"publicName"`
+	// Persist caches a generated key to disk (echPersistFile) so it stays stable
+	// across restarts. Enabled by default; set persist: false to instead derive
+	// the key deterministically from the seed without writing a file.
+	Persist *bool `mapstructure:"persist"`
+}
+
+const (
+	echPersistFile = "ech.json"
+	// defaultECHPublicName is the cover SNI used when ech.publicName is unset.
+	// cloudflare-ech.com is the outer SNI shared by every Cloudflare ECH site,
+	// so using it blends our traffic into that shared ECH anonymity set.
+	defaultECHPublicName = "cloudflare-ech.com"
+)
 
 type serverConfigRealm struct {
 	STUNServers       []string               `mapstructure:"stunServers"`
@@ -1460,12 +1498,96 @@ func (c *serverConfig) fillEventLogger(hyConfig *server.Config) error {
 	return nil
 }
 
+// fillECHConfig installs the server's ECH key pair. ECH is on by default
+// (disable with ech.disable). Must run after fillTLSConfig and before
+// fillTrafficLogger (so the config can be served via /ech).
+func (c *serverConfig) fillECHConfig(hyConfig *server.Config) error {
+	if c.ECH.Disable {
+		return nil
+	}
+	// Default the persisted key location to the config file's directory (e.g.
+	// /etc/hysteria/ech.json), falling back to the working directory.
+	persistPath := echPersistFile
+	if c.configDir != "" {
+		persistPath = filepath.Join(c.configDir, echPersistFile)
+	}
+
+	// Public name (outer/cover SNI). When unset, use the shared Cloudflare ECH
+	// public name so we blend into that anonymity set.
+	publicName := c.ECH.PublicName
+	if publicName == "" {
+		publicName = defaultECHPublicName
+	}
+
+	// Key material. Persistence is on by default: reuse a cached random key, or
+	// generate and save one, so it stays stable across restarts. With
+	// persist:false, derive the key deterministically from the seed (ech.seed,
+	// else trafficStats.secret) without writing a file.
+	persistOn := c.ECH.Persist == nil || *c.ECH.Persist
+
+	var (
+		key        tls.EncryptedClientHelloKey
+		configList []byte
+		err        error
+	)
+	if persistOn {
+		// Reuse the cached key if present; otherwise generate and save one.
+		if k, list, loadedName, lerr := utils.LoadECHKey(persistPath); lerr == nil {
+			hyConfig.TLSConfig.EncryptedClientHelloKeys = []tls.EncryptedClientHelloKey{k}
+			c.echConfigList = utils.EncodeECHConfigList(list)
+			c.echPublicName = loadedName
+			return nil
+		} else if !errors.Is(lerr, os.ErrNotExist) {
+			return configError{Field: "ech.persist", Err: lerr}
+		}
+		if key, configList, err = utils.GenerateECHKeyConfig(publicName); err != nil {
+			return configError{Field: "ech", Err: err}
+		}
+		if serr := utils.SaveECHKey(persistPath, publicName, key, configList); serr != nil {
+			// e.g. a read-only filesystem: fall back to a seed-derived key,
+			// which is stable across restarts without writing a file. With no
+			// seed, keep the just-generated ephemeral key (changes on restart).
+			seed := c.ECH.Seed
+			if seed == "" {
+				seed = c.TrafficStats.Secret
+			}
+			if seed != "" {
+				logger.Warn("ECH: failed to persist key, falling back to seed-derived key",
+					zap.String("path", persistPath), zap.Error(serr))
+				if key, configList, err = utils.DeriveECHKeyConfig([]byte(seed), publicName); err != nil {
+					return configError{Field: "ech", Err: err}
+				}
+			} else {
+				logger.Warn("ECH: failed to persist key and no seed available; using an ephemeral key that changes on restart",
+					zap.String("path", persistPath), zap.Error(serr))
+			}
+		}
+	} else {
+		seed := c.ECH.Seed
+		if seed == "" {
+			seed = c.TrafficStats.Secret
+		}
+		if seed == "" {
+			return configError{Field: "ech.seed", Err: errors.New("ECH with persist:false requires a seed (set ech.seed or trafficStats.secret)")}
+		}
+		if key, configList, err = utils.DeriveECHKeyConfig([]byte(seed), publicName); err != nil {
+			return configError{Field: "ech", Err: err}
+		}
+	}
+
+	hyConfig.TLSConfig.EncryptedClientHelloKeys = []tls.EncryptedClientHelloKey{key}
+	c.echConfigList = utils.EncodeECHConfigList(configList)
+	c.echPublicName = publicName
+	return nil
+}
+
 func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 	if c.TrafficStats.Listen != "" {
 		// If per-user outbounds are enabled, expose the /outbound management API
 		// on the same trafficStats server (shares listen address and secret).
 		puo, _ := hyConfig.OutboundProvider.(*outbounds.PerUserOutbounds)
 		tss := trafficlogger.NewTrafficStatsServerWithOutbounds(c.TrafficStats.Secret, puo)
+		tss.SetECH(c.echConfigList, c.echPublicName)
 		hyConfig.TrafficLogger = tss
 		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
 	}
@@ -1584,6 +1706,7 @@ func (c *serverConfig) Config() (*server.Config, error) {
 	fillers := []func(*server.Config) error{
 		c.fillConn,
 		c.fillTLSConfig,
+		c.fillECHConfig,
 		c.fillQUICConfig,
 		c.fillRequestHook,
 		c.fillOutboundConfig,
@@ -1618,6 +1741,9 @@ func runServer(v *viper.Viper) {
 	var config serverConfig
 	if err := v.Unmarshal(&config); err != nil {
 		logger.Fatal("failed to parse server config", zap.Error(err))
+	}
+	if cf := v.ConfigFileUsed(); cf != "" {
+		config.configDir = filepath.Dir(cf)
 	}
 	hyConfig, err := config.Config()
 	if err != nil {
