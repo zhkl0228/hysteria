@@ -7,7 +7,7 @@ import (
 
 func TestResolver(t *testing.T) {
 	r := &Resolver{
-		URL: "https://1.1.1.1/dns-query",
+		URL: "https://dns.alidns.com/dns-query",
 	}
 	ipv4, err := r.LookupA("www.wikipedia.org")
 	if err != nil {

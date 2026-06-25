@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	testListen   = "127.82.39.147:12947"
+	testListen   = "127.0.0.1:0" // ":0" picks a free port; portable across macOS/Linux
 	testCAFile   = "./testcerts/ca"
 	testCertFile = "./testcerts/cert"
 	testKeyFile  = "./testcerts/key"
@@ -48,10 +48,11 @@ func TestCertificateLoaderFullChain(t *testing.T) {
 	assert.NoError(t, err)
 	defer lis.Close()
 	go http.Serve(lis, nil)
+	server := lis.Addr().String()
 
-	assert.Error(t, runTestTLSClient("unmatched-sni.example.com"))
-	assert.Error(t, runTestTLSClient(""))
-	assert.NoError(t, runTestTLSClient("example.com"))
+	assert.Error(t, runTestTLSClient(server, "unmatched-sni.example.com"))
+	assert.Error(t, runTestTLSClient(server, ""))
+	assert.NoError(t, runTestTLSClient(server, "example.com"))
 }
 
 func TestCertificateLoaderNoSAN(t *testing.T) {
@@ -70,8 +71,9 @@ func TestCertificateLoaderNoSAN(t *testing.T) {
 	assert.NoError(t, err)
 	defer lis.Close()
 	go http.Serve(lis, nil)
+	server := lis.Addr().String()
 
-	assert.NoError(t, runTestTLSClient(""))
+	assert.NoError(t, runTestTLSClient(server, ""))
 }
 
 func TestCertificateLoaderReplaceCertificate(t *testing.T) {
@@ -90,14 +92,15 @@ func TestCertificateLoaderReplaceCertificate(t *testing.T) {
 	assert.NoError(t, err)
 	defer lis.Close()
 	go http.Serve(lis, nil)
+	server := lis.Addr().String()
 
-	assert.NoError(t, runTestTLSClient("example.com"))
-	assert.Error(t, runTestTLSClient("2.example.com"))
+	assert.NoError(t, runTestTLSClient(server, "example.com"))
+	assert.Error(t, runTestTLSClient(server, "2.example.com"))
 
 	assert.NoError(t, generateTestCertificate([]string{"2.example.com"}, "fullchain"))
 
-	assert.Error(t, runTestTLSClient("example.com"))
-	assert.NoError(t, runTestTLSClient("2.example.com"))
+	assert.Error(t, runTestTLSClient(server, "example.com"))
+	assert.NoError(t, runTestTLSClient(server, "2.example.com"))
 }
 
 func generateTestCertificate(dnssan []string, certType string) error {
@@ -120,10 +123,10 @@ func generateTestCertificate(dnssan []string, certType string) error {
 	return nil
 }
 
-func runTestTLSClient(sni string) error {
+func runTestTLSClient(server, sni string) error {
 	args := []string{
 		"certloader_test_tlsclient.py",
-		"--server", testListen,
+		"--server", server,
 		"--ca", testCAFile,
 	}
 	if sni != "" {
