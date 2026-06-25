@@ -8,8 +8,22 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// pickFreeAddr returns a free 127.0.0.1:<port> address. Each test uses a
+// unique fixed address so the global mux manager's address-keyed map doesn't
+// alias across tests.
+func pickFreeAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("pick free addr: %v", err)
+	}
+	addr := l.Addr().String()
+	l.Close()
+	return addr
+}
+
 func TestListenSOCKS(t *testing.T) {
-	address := "127.2.39.129:11081"
+	address := pickFreeAddr(t)
 
 	sl, err := ListenSOCKS(address)
 	if !assert.NoError(t, err) {
@@ -38,7 +52,7 @@ func TestListenSOCKS(t *testing.T) {
 }
 
 func TestListenHTTP(t *testing.T) {
-	address := "127.2.39.129:11082"
+	address := pickFreeAddr(t)
 
 	hl, err := ListenHTTP(address)
 	if !assert.NoError(t, err) {
@@ -67,7 +81,7 @@ func TestListenHTTP(t *testing.T) {
 }
 
 func TestRelease(t *testing.T) {
-	address := "127.2.39.129:11083"
+	address := pickFreeAddr(t)
 
 	hl, err := ListenHTTP(address)
 	if !assert.NoError(t, err) {
