@@ -47,9 +47,19 @@ func NewClient(config *Config) (Client, *HandshakeInfo, error) {
 		return nil, nil, err
 	}
 	c := &clientImpl{
-		config: config,
+		config:        config,
+		echConfigList: config.TLSConfig.ECHConfigList,
 	}
 	info, err := c.connect()
+	// crypto/tls aborts the handshake whenever ECH is rejected, so a config list
+	// that has gone stale (server key rotated or replaced) would otherwise lock
+	// the client out. The server sends its current configs as retry configs;
+	// take them and try once more.
+	var echErr *tls.ECHRejectionError
+	if err != nil && len(c.echConfigList) > 0 && errors.As(err, &echErr) && len(echErr.RetryConfigList) > 0 {
+		c.echConfigList = echErr.RetryConfigList
+		info, err = c.connect()
+	}
 	if err != nil {
 		return nil, nil, err
 	}
@@ -62,6 +72,10 @@ type clientImpl struct {
 	pktConn net.PacketConn
 	tr      *quic.Transport
 	conn    *quic.Conn
+
+	// echConfigList starts out as TLSConfig.ECHConfigList and is replaced by the
+	// server's retry configs if the initial one is rejected.
+	echConfigList []byte
 
 	udpSM *udpSessionManager
 }
@@ -78,7 +92,20 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		VerifyPeerCertificate:          c.config.TLSConfig.VerifyPeerCertificate,
 		RootCAs:                        c.config.TLSConfig.RootCAs,
 		GetClientCertificate:           c.config.TLSConfig.GetClientCertificate,
-		EncryptedClientHelloConfigList: c.config.TLSConfig.ECHConfigList,
+		EncryptedClientHelloConfigList: c.echConfigList,
+	}
+	if len(c.echConfigList) > 0 {
+		// On ECH rejection crypto/tls ignores InsecureSkipVerify and
+		// VerifyPeerCertificate, verifying the certificate against the public
+		// name with the system roots instead. For the self-signed and pinned
+		// certificate setups Hysteria commonly uses that turns every rejection
+		// into an opaque certificate error, hiding the retry configs the server
+		// sent. Skip it: crypto/tls aborts the handshake on rejection either
+		// way, so no data can flow, and the caller gets the actionable
+		// ECHRejectionError instead.
+		tlsConfig.EncryptedClientHelloRejectionVerify = func(tls.ConnectionState) error {
+			return nil
+		}
 	}
 	quicConfig := &quic.Config{
 		InitialStreamReceiveWindow:     c.config.QUICConfig.InitialStreamReceiveWindow,

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -86,6 +86,13 @@ type serverConfig struct {
 	UserOutbounds         []serverConfigUserOutbound  `mapstructure:"userOutbounds"`
 	TrafficStats          serverConfigTrafficStats    `mapstructure:"trafficStats"`
 	Masquerade            serverConfigMasquerade      `mapstructure:"masquerade"`
+
+	// configDir is the directory holding the loaded config file. It is the
+	// default location for the ECH key file.
+	configDir string
+	// echConfigList is the base64 ECHConfigList produced by fillTLSConfig, kept
+	// so fillTrafficLogger can serve it from the /ech endpoint.
+	echConfigList string
 }
 
 type serverConfigRealm struct {
@@ -122,6 +129,13 @@ type serverConfigTLS struct {
 }
 
 type serverConfigECH struct {
+	// Enabled is nil-as-true, so an `ech` block that only sets keyPath behaves
+	// exactly as upstream: present means on.
+	Enabled *bool `mapstructure:"enabled"`
+	// PublicName is the outer (cover) SNI. Only used when generating a key,
+	// i.e. when KeyPath does not exist yet.
+	PublicName string `mapstructure:"publicName"`
+	// KeyPath defaults to ech.pem next to the config file.
 	KeyPath string `mapstructure:"keyPath"`
 }
 
@@ -1112,17 +1126,8 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 		}
 		hyConfig.TLSConfig.GetCertificate = cmCfg.GetCertificate
 	}
-	if c.ECH != nil {
-		if c.ECH.KeyPath == "" {
-			return configError{Field: "ech.keyPath", Err: errors.New("empty ECH key path")}
-		}
-		keys, configList, err := utils.LoadECHKeys(c.ECH.KeyPath)
-		if err != nil {
-			return configError{Field: "ech.keyPath", Err: err}
-		}
-		hyConfig.TLSConfig.ECHKeys = keys
-		logger.Info("ECH enabled, set the following config list on clients (tls.ech)",
-			zap.String("configList", base64.StdEncoding.EncodeToString(configList)))
+	if err := c.fillECHKeys(hyConfig); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1486,6 +1491,9 @@ func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 		// on the same trafficStats server (shares listen address and secret).
 		puo, _ := hyConfig.OutboundProvider.(*outbounds.PerUserOutbounds)
 		tss := trafficlogger.NewTrafficStatsServerWithOutbounds(c.TrafficStats.Secret, puo)
+		// Serve the ECH config list from /ech so clients can fetch it instead of
+		// having it copied out of the server log by hand.
+		tss.SetECH(c.echConfigList)
 		hyConfig.TrafficLogger = tss
 		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
 	}
@@ -1639,6 +1647,9 @@ func runServer(v *viper.Viper) {
 	var config serverConfig
 	if err := v.Unmarshal(&config); err != nil {
 		logger.Fatal("failed to parse server config", zap.Error(err))
+	}
+	if cf := v.ConfigFileUsed(); cf != "" {
+		config.configDir = filepath.Dir(cf)
 	}
 	hyConfig, err := config.Config()
 	if err != nil {

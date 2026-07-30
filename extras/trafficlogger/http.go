@@ -24,6 +24,11 @@ const (
 type TrafficStatsServer interface {
 	server.TrafficLogger
 	http.Handler
+
+	// SetECH sets the base64-encoded ECHConfigList served by the /ech endpoint,
+	// so clients can fetch the server's ECH config instead of having it copied
+	// out of the server log by hand. An empty string disables the endpoint.
+	SetECH(configList string)
 }
 
 func NewTrafficStatsServer(secret string) TrafficStatsServer {
@@ -54,6 +59,16 @@ type trafficStatsServerImpl struct {
 
 	// Outbounds, if set, enables the /outbound management endpoints.
 	Outbounds *outbounds.PerUserOutbounds
+
+	// echConfigList is the base64-encoded ECHConfigList served by /ech.
+	// Guarded by Mutex.
+	echConfigList string
+}
+
+func (s *trafficStatsServerImpl) SetECH(configList string) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	s.echConfigList = configList
 }
 
 type trafficStatsEntry struct {
@@ -134,6 +149,10 @@ func (s *trafficStatsServerImpl) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 	if r.Method == http.MethodGet && r.URL.Path == "/dump/streams" {
 		s.getDumpStreams(w, r)
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Path == "/ech" {
+		s.getECH(w, r)
 		return
 	}
 	if s.Outbounds != nil && r.URL.Path == "/outbound" {
@@ -377,6 +396,26 @@ func (s *trafficStatsServerImpl) getDumpStreams(w http.ResponseWriter, r *http.R
 	}{entries}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	err := json.NewEncoder(w).Encode(&wrapper)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// getECH returns the server's base64-encoded ECHConfigList, which clients put in
+// their tls.ech field. Returns 404 when ECH is not enabled.
+func (s *trafficStatsServerImpl) getECH(w http.ResponseWriter, r *http.Request) {
+	s.Mutex.RLock()
+	configList := s.echConfigList
+	s.Mutex.RUnlock()
+
+	if configList == "" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	err := json.NewEncoder(w).Encode(&struct {
+		Config string `json:"config"`
+	}{configList})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}

@@ -75,3 +75,32 @@ func TestOutboundAPIDisabled(t *testing.T) {
 	rec := doReq(t, srv, http.MethodGet, "/outbound", testSecret, "")
 	assert.Equal(t, http.StatusNotFound, rec.Code)
 }
+
+func TestECHEndpoint(t *testing.T) {
+	const configList = "AEv+DQBHAAAgACB3rc0Q"
+
+	srv := NewTrafficStatsServer(testSecret)
+
+	// ECH not configured: the endpoint stays hidden.
+	rec := doReq(t, srv, http.MethodGet, "/ech", testSecret, "")
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+
+	srv.SetECH(configList)
+
+	// Still requires the secret, same as every other endpoint.
+	rec = doReq(t, srv, http.MethodGet, "/ech", "", "")
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+
+	rec = doReq(t, srv, http.MethodGet, "/ech", testSecret, "")
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp struct {
+		Config string `json:"config"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Equal(t, configList, resp.Config)
+
+	// Clearing it hides the endpoint again.
+	srv.SetECH("")
+	rec = doReq(t, srv, http.MethodGet, "/ech", testSecret, "")
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
