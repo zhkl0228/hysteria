@@ -6,12 +6,17 @@ on:
       - app/v*.*.*
 
 jobs:
+  # Fork: this is upstream's release path — it publishes to Cloudflare R2 and the
+  # Hysteria API using secrets that cannot exist here. This fork releases via
+  # fork-release.yml (`fork-v*` tags) instead.
   build:
+    if: github.repository == 'apernet/hysteria'
     uses: ./.github/workflows/build-common.yml
 
   publish:
     name: Publish
     needs: build
+    if: github.repository == 'apernet/hysteria'
     runs-on: ubuntu-latest
     steps:
       - name: Check out

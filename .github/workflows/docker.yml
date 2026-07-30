@@ -7,6 +7,9 @@ on:
 
 jobs:
   docker:
+    # Fork: pushes to upstream's Docker Hub repo and needs DOCKERHUB_* secrets
+    # that cannot exist here. This fork releases via fork-release.yml instead.
+    if: github.repository == 'apernet/hysteria'
     runs-on: ubuntu-latest
     env:
       ACTIONS_ALLOW_UNSECURE_COMMANDS: true
