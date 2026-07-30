@@ -9,6 +9,10 @@ on:
 
 jobs:
   publish:
+    # Fork: the Cloudflare Pages project (hy2scripts) and its secrets belong to
+    # upstream, so this job can only ever fail here. It fires whenever a rebase
+    # brings in an upstream change under scripts/.
+    if: github.repository == 'apernet/hysteria'
     runs-on: ubuntu-latest
     permissions:
       contents: read
