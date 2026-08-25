@@ -28,6 +28,7 @@ type Config struct {
 	TLSConfig             TLSConfig
 	QUICConfig            QUICConfig
 	Conn                  net.PacketConn
+	StatelessResetKey     *quic.StatelessResetKey
 	Cleanup               io.Closer
 	RequestHook           RequestHook
 	Outbound              Outbound
@@ -132,6 +133,8 @@ type QUICConfig struct {
 	MaxIdleTimeout                 time.Duration
 	MaxIncomingStreams             int64
 	DisablePathMTUDiscovery        bool // The server may still override this to true on unsupported platforms.
+	DisableGSO                     bool
+	DisableStatelessReset          bool
 }
 
 type CongestionConfig struct {

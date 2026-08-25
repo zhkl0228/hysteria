@@ -23,14 +23,18 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/apernet/hysteria/app/v2/internal/mimic"
+
 	"github.com/caddyserver/certmagic"
 	"github.com/libdns/cloudflare"
 	"github.com/libdns/duckdns"
 	"github.com/libdns/gandi"
 	"github.com/libdns/godaddy"
-	"github.com/libdns/namedotcom"
-	"github.com/libdns/vultr"
-	"github.com/mholt/acmez/acme"
+	"github.com/libdns/namecheap"
+	"github.com/libdns/njalla"
+	"github.com/libdns/porkbun"
+	"github.com/libdns/vultr/v2"
+	"github.com/mholt/acmez/v3/acme"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
@@ -51,7 +55,10 @@ import (
 )
 
 const (
-	defaultListenAddr = ":443"
+	defaultListenAddr                  = ":443"
+	masqueradeProxyBufferSize          = 32 * 1024
+	masqueradeProxyMaxIdleConnections  = 100
+	masqueradeProxyMaxIdleConnsPerHost = 32
 )
 
 var serverCmd = &cobra.Command{
@@ -72,6 +79,7 @@ type serverConfig struct {
 	ACME                  *serverConfigACME           `mapstructure:"acme"`
 	ECH                   *serverConfigECH            `mapstructure:"ech"`
 	QUIC                  serverConfigQUIC            `mapstructure:"quic"`
+	Mimic                 mimicConfig                 `mapstructure:"mimic"`
 	Congestion            serverConfigCongestion      `mapstructure:"congestion"`
 	Bandwidth             serverConfigBandwidth       `mapstructure:"bandwidth"`
 	IgnoreClientBandwidth bool                        `mapstructure:"ignoreClientBandwidth"`
@@ -182,6 +190,7 @@ type serverConfigQUIC struct {
 	MaxIdleTimeout              time.Duration `mapstructure:"maxIdleTimeout"`
 	MaxIncomingStreams          int64         `mapstructure:"maxIncomingStreams"`
 	DisablePathMTUDiscovery     bool          `mapstructure:"disablePathMTUDiscovery"`
+	DisableStatelessReset       bool          `mapstructure:"disableStatelessReset"`
 }
 
 type serverConfigBandwidth struct {
@@ -306,6 +315,31 @@ type serverConfigMasqueradeProxy struct {
 	RewriteHost bool   `mapstructure:"rewriteHost"`
 	XForwarded  bool   `mapstructure:"xForwarded"`
 	Insecure    bool   `mapstructure:"insecure"`
+}
+
+type masqueradeProxyBufferPool struct {
+	pool sync.Pool
+}
+
+func newMasqueradeProxyBufferPool() *masqueradeProxyBufferPool {
+	return &masqueradeProxyBufferPool{
+		pool: sync.Pool{
+			New: func() any {
+				return make([]byte, masqueradeProxyBufferSize)
+			},
+		},
+	}
+}
+
+func (p *masqueradeProxyBufferPool) Get() []byte {
+	return p.pool.Get().([]byte)
+}
+
+func (p *masqueradeProxyBufferPool) Put(buf []byte) {
+	if cap(buf) < masqueradeProxyBufferSize {
+		return
+	}
+	p.pool.Put(buf[:masqueradeProxyBufferSize])
 }
 
 type serverConfigMasqueradeString struct {
@@ -1055,48 +1089,56 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 			if c.ACME.DNS.Config == nil {
 				return configError{Field: "acme.dns.config", Err: errors.New("empty DNS provider config")}
 			}
+			var dnsProvider certmagic.DNSProvider
 			switch strings.ToLower(c.ACME.DNS.Name) {
 			case "cloudflare":
-				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
-					DNSProvider: &cloudflare.Provider{
-						APIToken: c.ACME.DNS.Config["cloudflare_api_token"],
-					},
+				dnsProvider = &cloudflare.Provider{
+					APIToken: c.ACME.DNS.Config["cloudflare_api_token"],
 				}
 			case "duckdns":
-				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
-					DNSProvider: &duckdns.Provider{
-						APIToken:       c.ACME.DNS.Config["duckdns_api_token"],
-						OverrideDomain: c.ACME.DNS.Config["duckdns_override_domain"],
-					},
+				dnsProvider = &duckdns.Provider{
+					APIToken:       c.ACME.DNS.Config["duckdns_api_token"],
+					OverrideDomain: c.ACME.DNS.Config["duckdns_override_domain"],
 				}
 			case "gandi":
-				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
-					DNSProvider: &gandi.Provider{
-						BearerToken: c.ACME.DNS.Config["gandi_api_token"],
-					},
+				dnsProvider = &gandi.Provider{
+					BearerToken: c.ACME.DNS.Config["gandi_api_token"],
 				}
 			case "godaddy":
-				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
-					DNSProvider: &godaddy.Provider{
-						APIToken: c.ACME.DNS.Config["godaddy_api_token"],
-					},
+				dnsProvider = &godaddy.Provider{
+					APIToken: c.ACME.DNS.Config["godaddy_api_token"],
 				}
-			case "namedotcom":
-				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
-					DNSProvider: &namedotcom.Provider{
-						Token:  c.ACME.DNS.Config["namedotcom_token"],
-						User:   c.ACME.DNS.Config["namedotcom_user"],
-						Server: c.ACME.DNS.Config["namedotcom_server"],
-					},
+			case "namecheap":
+				dnsProvider = &namecheap.Provider{
+					APIKey:      c.ACME.DNS.Config["namecheap_api_key"],
+					User:        c.ACME.DNS.Config["namecheap_api_user"],
+					APIEndpoint: c.ACME.DNS.Config["namecheap_api_endpoint"],
+					ClientIP:    c.ACME.DNS.Config["namecheap_client_ip"],
+				}
+			case "njalla":
+				dnsProvider = &njalla.Provider{
+					APIToken: c.ACME.DNS.Config["njalla_api_token"],
+				}
+			case "porkbun":
+				dnsProvider = &porkbun.Provider{
+					APIKey:       c.ACME.DNS.Config["porkbun_api_key"],
+					APISecretKey: c.ACME.DNS.Config["porkbun_api_secret_key"],
 				}
 			case "vultr":
-				cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
-					DNSProvider: &vultr.Provider{
-						APIToken: c.ACME.DNS.Config["vultr_api_token"],
-					},
+				dnsProvider = &vultr.Provider{
+					APIToken: c.ACME.DNS.Config["vultr_api_token"],
 				}
+			case "namedotcom":
+				// Dropped: upstream never released a libdns v1 compatible version,
+				// which the current certmagic requires.
+				return configError{Field: "acme.dns.name", Err: errors.New("namedotcom is no longer supported")}
 			default:
 				return configError{Field: "acme.dns.name", Err: errors.New("unsupported DNS provider")}
+			}
+			cmIssuer.DNS01Solver = &certmagic.DNS01Solver{
+				DNSManager: certmagic.DNSManager{
+					DNSProvider: dnsProvider,
+				},
 			}
 		case "":
 			// Legacy compatibility mode
@@ -1183,6 +1225,9 @@ func (c *serverConfig) fillQUICConfig(hyConfig *server.Config) error {
 		MaxIdleTimeout:                 c.QUIC.MaxIdleTimeout,
 		MaxIncomingStreams:             c.QUIC.MaxIncomingStreams,
 		DisablePathMTUDiscovery:        c.QUIC.DisablePathMTUDiscovery,
+		DisableStatelessReset:          c.QUIC.DisableStatelessReset,
+		// See the client side: Mimic and GSO are mutually exclusive.
+		DisableGSO: c.Mimic.Enabled,
 	}
 	return nil
 }
@@ -1500,6 +1545,99 @@ func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 	return nil
 }
 
+func newMasqueradeProxyHandler(config serverConfigMasqueradeProxy) (http.Handler, error) {
+	if config.URL == "" {
+		return nil, errors.New("empty proxy url")
+	}
+	target, transport, err := newMasqueradeProxyTarget(config.URL, config.Insecure)
+	if err != nil {
+		return nil, err
+	}
+	return &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(target)
+			// SetURL rewrites the Host header,
+			// but we don't want that if rewriteHost is false
+			if !config.RewriteHost {
+				r.Out.Host = r.In.Host
+			}
+			if config.XForwarded {
+				r.SetXForwarded()
+			}
+		},
+		Transport:  transport,
+		BufferPool: newMasqueradeProxyBufferPool(),
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			logger.Error("HTTP reverse proxy error", zap.Error(err))
+			w.WriteHeader(http.StatusBadGateway)
+		},
+	}, nil
+}
+
+func newMasqueradeProxyTarget(rawURL string, insecure bool) (*url.URL, http.RoundTripper, error) {
+	target, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch target.Scheme {
+	case "http", "https":
+		transport := http.DefaultTransport
+		if insecure {
+			tr := http.DefaultTransport.(*http.Transport).Clone()
+			if tr.TLSClientConfig == nil {
+				tr.TLSClientConfig = &tls.Config{}
+			} else {
+				tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+			}
+			tr.TLSClientConfig.InsecureSkipVerify = true
+			transport = tr
+		}
+		return target, transport, nil
+	case "unix":
+		return newUnixMasqueradeProxyTarget(target)
+	case "":
+		if strings.HasPrefix(target.Path, "/") {
+			return newUnixMasqueradeProxyTarget(target)
+		}
+		fallthrough
+	default:
+		return nil, nil, fmt.Errorf("unsupported protocol scheme \"%s\"", target.Scheme)
+	}
+}
+
+func newUnixMasqueradeProxyTarget(parsedURL *url.URL) (*url.URL, http.RoundTripper, error) {
+	if parsedURL.Opaque != "" {
+		return nil, nil, errors.New("invalid unix socket URL: path must be absolute")
+	}
+	if parsedURL.User != nil {
+		return nil, nil, errors.New("invalid unix socket URL: userinfo is not supported")
+	}
+	if parsedURL.Host != "" {
+		return nil, nil, errors.New("invalid unix socket URL: host must be empty")
+	}
+	if parsedURL.RawQuery != "" || parsedURL.ForceQuery || parsedURL.Fragment != "" {
+		return nil, nil, errors.New("invalid unix socket URL: query and fragment are not supported")
+	}
+	if parsedURL.Path == "" {
+		return nil, nil, errors.New("empty unix socket path")
+	}
+	if !strings.HasPrefix(parsedURL.Path, "/") {
+		return nil, nil, errors.New("invalid unix socket URL: path must be absolute")
+	}
+
+	socketPath := parsedURL.Path
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return dialer.DialContext(ctx, "unix", socketPath)
+	}
+	transport.MaxIdleConns = masqueradeProxyMaxIdleConnections
+	transport.MaxIdleConnsPerHost = masqueradeProxyMaxIdleConnsPerHost
+
+	return &url.URL{Scheme: "http", Host: "localhost"}, transport, nil
+}
+
 // fillMasqHandler must be called after fillConn, as we may need to extract the QUIC
 // port number from Conn for MasqTCPServer.
 func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
@@ -1513,52 +1651,10 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 		}
 		handler = http.FileServer(http.Dir(c.Masquerade.File.Dir))
 	case "proxy":
-		if c.Masquerade.Proxy.URL == "" {
-			return configError{Field: "masquerade.proxy.url", Err: errors.New("empty proxy url")}
-		}
-		u, err := url.Parse(c.Masquerade.Proxy.URL)
+		var err error
+		handler, err = newMasqueradeProxyHandler(c.Masquerade.Proxy)
 		if err != nil {
 			return configError{Field: "masquerade.proxy.url", Err: err}
-		}
-		if u.Scheme != "http" && u.Scheme != "https" {
-			return configError{Field: "masquerade.proxy.url", Err: fmt.Errorf("unsupported protocol scheme \"%s\"", u.Scheme)}
-		}
-		transport := http.DefaultTransport
-		if c.Masquerade.Proxy.Insecure {
-			transport = &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
-				// use default configs from http.DefaultTransport
-				Proxy: http.ProxyFromEnvironment,
-				DialContext: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				ForceAttemptHTTP2:     true,
-				MaxIdleConns:          100,
-				IdleConnTimeout:       90 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-			}
-		}
-		handler = &httputil.ReverseProxy{
-			Rewrite: func(r *httputil.ProxyRequest) {
-				r.SetURL(u)
-				// SetURL rewrites the Host header,
-				// but we don't want that if rewriteHost is false
-				if !c.Masquerade.Proxy.RewriteHost {
-					r.Out.Host = r.In.Host
-				}
-				if c.Masquerade.Proxy.XForwarded {
-					r.SetXForwarded()
-				}
-			},
-			Transport: transport,
-			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-				logger.Error("HTTP reverse proxy error", zap.Error(err))
-				w.WriteHeader(http.StatusBadGateway)
-			},
 		}
 	case "string":
 		if c.Masquerade.String.Content == "" {
@@ -1655,6 +1751,22 @@ func runServer(v *viper.Viper) {
 	if err != nil {
 		logger.Fatal("failed to load server config", zap.Error(err))
 	}
+
+	mimicInst, err := mimic.Start(
+		mimic.Config{
+			Enabled:   config.Mimic.Enabled,
+			Interface: config.Mimic.Interface,
+			XDPMode:   config.Mimic.XDPMode,
+			Path:      config.Mimic.Path,
+			ExtraArgs: config.Mimic.ExtraArgs,
+		},
+		mimic.RoleServer, []*net.UDPAddr{listenUDPAddr(config.Listen)}, logger,
+		func(err error) { logger.Fatal("mimic stopped", zap.Error(err)) },
+	)
+	if err != nil {
+		logger.Fatal("failed to start mimic", zap.Error(err))
+	}
+	defer mimicInst.Close()
 
 	s, err := server.NewServer(hyConfig)
 	if err != nil {
@@ -1791,4 +1903,17 @@ func extractPortFromAddr(addr string) int {
 		return 0
 	}
 	return port
+}
+
+// listenUDPAddr resolves the listen string for Mimic's filter. A wildcard host
+// stays wildcard: Mimic accepts one for a local filter.
+func listenUDPAddr(listen string) *net.UDPAddr {
+	if listen == "" {
+		listen = defaultListenAddr
+	}
+	addr, err := net.ResolveUDPAddr("udp", listen)
+	if err != nil {
+		return &net.UDPAddr{}
+	}
+	return addr
 }

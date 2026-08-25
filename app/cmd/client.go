@@ -28,6 +28,7 @@ import (
 
 	"github.com/apernet/hysteria/app/v2/internal/forwarding"
 	"github.com/apernet/hysteria/app/v2/internal/http"
+	"github.com/apernet/hysteria/app/v2/internal/mimic"
 	"github.com/apernet/hysteria/app/v2/internal/proxymux"
 	"github.com/apernet/hysteria/app/v2/internal/redirect"
 	"github.com/apernet/hysteria/app/v2/internal/sockopts"
@@ -78,6 +79,7 @@ type clientConfig struct {
 	Obfs          clientConfigObfs       `mapstructure:"obfs"`
 	TLS           clientConfigTLS        `mapstructure:"tls"`
 	QUIC          clientConfigQUIC       `mapstructure:"quic"`
+	Mimic         mimicConfig            `mapstructure:"mimic"`
 	Congestion    clientConfigCongestion `mapstructure:"congestion"`
 	Bandwidth     clientConfigBandwidth  `mapstructure:"bandwidth"`
 	FastOpen      bool                   `mapstructure:"fastOpen"`
@@ -90,6 +92,14 @@ type clientConfig struct {
 	UDPTProxy     *udpTProxyConfig       `mapstructure:"udpTProxy"`
 	TCPRedirect   *tcpRedirectConfig     `mapstructure:"tcpRedirect"`
 	TUN           *tunConfig             `mapstructure:"tun"`
+}
+
+type mimicConfig struct {
+	Enabled   bool     `mapstructure:"enabled"`
+	Interface string   `mapstructure:"interface"`
+	XDPMode   string   `mapstructure:"xdpMode"`
+	Path      string   `mapstructure:"path"`
+	ExtraArgs []string `mapstructure:"extraArgs"`
 }
 
 type clientConfigRealm struct {
@@ -159,6 +169,7 @@ type clientConfigQUIC struct {
 	MaxIdleTimeout              time.Duration            `mapstructure:"maxIdleTimeout"`
 	KeepAlivePeriod             time.Duration            `mapstructure:"keepAlivePeriod"`
 	DisablePathMTUDiscovery     bool                     `mapstructure:"disablePathMTUDiscovery"`
+	DisableChromeParrot         bool                     `mapstructure:"disableChromeParrot"`
 	Sockopts                    clientConfigQUICSockopts `mapstructure:"sockopts"`
 }
 
@@ -434,6 +445,19 @@ func (c *clientConfig) fillTLSConfig(hyConfig *client.Config) error {
 	return nil
 }
 
+func (c *clientConfig) validateMimic() error {
+	if !c.Mimic.Enabled {
+		return nil
+	}
+	// Mimic matches traffic by a single ip:port. Port hopping moves the server
+	// port over a range, which would need one filter per port.
+	_, port, _ := parseServerAddrString(c.Server)
+	if isPortHoppingPort(port) {
+		return configError{Field: "mimic", Err: errors.New("cannot be used with port hopping")}
+	}
+	return nil
+}
+
 func (c *clientConfig) fillQUICConfig(hyConfig *client.Config) error {
 	hyConfig.QUICConfig = client.QUICConfig{
 		InitialStreamReceiveWindow:     c.QUIC.InitStreamReceiveWindow,
@@ -443,6 +467,10 @@ func (c *clientConfig) fillQUICConfig(hyConfig *client.Config) error {
 		MaxIdleTimeout:                 c.QUIC.MaxIdleTimeout,
 		KeepAlivePeriod:                c.QUIC.KeepAlivePeriod,
 		DisablePathMTUDiscovery:        c.QUIC.DisablePathMTUDiscovery,
+		DisableChromeParrot:            c.QUIC.DisableChromeParrot,
+		// Mimic rewrites packets after they leave the socket, which corrupts
+		// every segment but the first of a GSO batch.
+		DisableGSO: c.Mimic.Enabled,
 	}
 	return nil
 }
@@ -816,6 +844,12 @@ func runClient(v *viper.Viper) {
 	if err := v.Unmarshal(&config); err != nil {
 		logger.Fatal("failed to parse client config", zap.Error(err))
 	}
+
+	if err := config.validateMimic(); err != nil {
+		logger.Fatal("failed to load client config", zap.Error(err))
+	}
+	mimicInst := config.startMimic()
+	defer mimicInst.Close()
 
 	c, err := client.NewReconnectableClient(
 		config.Config,
@@ -1453,4 +1487,62 @@ func (l *tunLogger) UDPError(addr string, err error) {
 	} else {
 		logger.Warn("TUN UDP error", zap.String("addr", addr), zap.Error(err))
 	}
+}
+
+// startMimic brings Mimic up for this client, if enabled. Every command that
+// opens a connection needs this, not just "client": Mimic has to be attached
+// before the first packet, or the server sees plain UDP and drops it.
+func (c *clientConfig) startMimic() *mimic.Instance {
+	if err := c.validateMimic(); err != nil {
+		logger.Fatal("failed to load client config", zap.Error(err))
+	}
+	if !c.Mimic.Enabled {
+		return nil
+	}
+	addrs, err := c.mimicServerAddrs()
+	if err != nil {
+		logger.Fatal("failed to resolve server address for mimic", zap.Error(err))
+	}
+	inst, err := mimic.Start(
+		mimic.Config{
+			Enabled:   c.Mimic.Enabled,
+			Interface: c.Mimic.Interface,
+			XDPMode:   c.Mimic.XDPMode,
+			Path:      c.Mimic.Path,
+			ExtraArgs: c.Mimic.ExtraArgs,
+		},
+		mimic.RoleClient, addrs, logger,
+		func(err error) { logger.Fatal("mimic stopped", zap.Error(err)) },
+	)
+	if err != nil {
+		logger.Fatal("failed to start mimic", zap.Error(err))
+	}
+	return inst
+}
+
+// mimicServerAddrs resolves the server address for Mimic's filters. Mimic needs
+// literal ip:port, and a name can resolve to several addresses across both
+// families, so every one of them gets a filter: the client re-resolves on each
+// reconnect and may pick a different one than it did at startup.
+func (c *clientConfig) mimicServerAddrs() ([]*net.UDPAddr, error) {
+	host, portStr, hostPort := parseServerAddrString(c.Server)
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server port %q: %w", portStr, err)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return []*net.UDPAddr{{IP: ip, Port: port}}, nil
+	}
+	ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip", host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no addresses for %s", hostPort)
+	}
+	addrs := make([]*net.UDPAddr, 0, len(ips))
+	for _, ip := range ips {
+		addrs = append(addrs, &net.UDPAddr{IP: ip, Port: port})
+	}
+	return addrs, nil
 }
