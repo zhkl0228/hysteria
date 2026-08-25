@@ -107,6 +107,14 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 			return nil
 		}
 	}
+	// Chrome parrot and ECH cannot be used together. The parrot swaps crypto/tls
+	// for uTLS, whose adapter drops EncryptedClientHelloRejectionVerify, never
+	// reports back whether ECH was accepted, and signals rejection with uTLS's
+	// own error type instead of *tls.ECHRejectionError. The result is a
+	// connection that silently loses ECH status and cannot recover from a stale
+	// config. ECH is the stronger property of the two, so it wins; the parroted
+	// fingerprint is given up for connections that use it.
+	chromeParrot := !c.config.QUICConfig.DisableChromeParrot && len(c.echConfigList) == 0
 	quicConfig := &quic.Config{
 		InitialStreamReceiveWindow:     c.config.QUICConfig.InitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         c.config.QUICConfig.MaxStreamReceiveWindow,
@@ -119,10 +127,10 @@ func (c *clientImpl) connect() (*HandshakeInfo, error) {
 		MaxDatagramFrameSize:           protocol.MaxDatagramFrameSize,
 		OmitMaxDatagramFrameSize:       true,
 		DisablePathManager:             true,
-		ChromeParrot:                   !c.config.QUICConfig.DisableChromeParrot,
+		ChromeParrot:                   chromeParrot,
 	}
 	tr := &quic.Transport{Conn: pktConn, DisableGSO: c.config.QUICConfig.DisableGSO}
-	if !c.config.QUICConfig.DisableChromeParrot {
+	if chromeParrot {
 		// Chrome uses a zero-length source connection ID. This has to be set on the
 		// Transport, since it fixes the length at which incoming packets' connection
 		// IDs are parsed; leaving it default yields 4-byte IDs, visible on the wire.

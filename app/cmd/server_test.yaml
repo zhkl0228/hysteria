@@ -30,6 +30,8 @@ tls:
   clientCA: some_ca.crt
 
 ech:
+  enabled: true
+  publicName: cover.example.com
   keyPath: some_ech.pem
 
 acme:

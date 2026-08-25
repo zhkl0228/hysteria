@@ -20,8 +20,15 @@ func TestServerConfig(t *testing.T) {
 	err := viper.ReadInConfig()
 	assert.NoError(t, err)
 	var config serverConfig
+	echEnabled := true
 	err = viper.Unmarshal(&config)
 	assert.NoError(t, err)
+	// configDir and echConfigList are not config file fields: the first is
+	// derived from the config file's location at load time, the second is
+	// produced by fillTLSConfig. Fill them in so the coverage check below only
+	// reports fields the fixture genuinely forgot.
+	config.configDir = "/etc/hysteria"
+	config.echConfigList = "some_ech_config_list"
 	assertAllFieldsSet(t, config, "server")
 	assert.Equal(t, config, serverConfig{
 		Listen: ":8443",
@@ -56,7 +63,9 @@ func TestServerConfig(t *testing.T) {
 			ClientCA: "some_ca.crt",
 		},
 		ECH: &serverConfigECH{
-			KeyPath: "some_ech.pem",
+			Enabled:    &echEnabled,
+			PublicName: "cover.example.com",
+			KeyPath:    "some_ech.pem",
 		},
 		ACME: &serverConfigACME{
 			Domains: []string{
@@ -237,6 +246,8 @@ func TestServerConfig(t *testing.T) {
 			ListenHTTPS: ":443",
 			ForceHTTPS:  true,
 		},
+		configDir:     "/etc/hysteria",
+		echConfigList: "some_ech_config_list",
 	})
 }
 

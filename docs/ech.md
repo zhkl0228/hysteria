@@ -83,6 +83,19 @@ read as a file, which may hold either base64 or a PEM `ECH CONFIGS` block.
 ECH also travels in share URIs as `?ech=<base64>`, so `hysteria share` output
 carries it automatically.
 
+### ECH turns off the Chrome QUIC fingerprint
+
+Chrome parroting (on by default, `quic.disableChromeParrot` to turn it off) and
+ECH are mutually exclusive, and a client configured with `tls.ech` silently
+takes the ECH side: the parrot is disabled for that connection.
+
+The parrot replaces `crypto/tls` with uTLS, and the adapter in between drops
+`EncryptedClientHelloRejectionVerify`, never reports back whether ECH was
+accepted, and reports rejection through uTLS's own error type rather than
+`*tls.ECHRejectionError`. Under the parrot, ECH would report as never accepted
+and the retry-config recovery below would not fire. ECH hides the SNI outright,
+which is the stronger property, so it wins.
+
 The client log line on a successful connection reports whether ECH was accepted:
 
 ```
