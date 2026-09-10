@@ -21,6 +21,12 @@ func unsetFields(v reflect.Value, path string) []string {
 		var unset []string
 		for i := range v.NumField() {
 			f := v.Type().Field(i)
+			// Unexported fields hold state derived at startup, not config:
+			// mapstructure cannot populate them, so a fixture cannot cover
+			// them and their zero value says nothing about config coverage.
+			if !f.IsExported() {
+				continue
+			}
 			name := f.Tag.Get("mapstructure")
 			if name == "" {
 				name = f.Name

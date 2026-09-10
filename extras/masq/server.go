@@ -19,10 +19,31 @@ type MasqTCPServer struct {
 	Handler    http.Handler
 	TLSConfig  *tls.Config
 	ForceHTTPS bool // Always 301 redirect from HTTP to HTTPS
+	// ACMEChallenge, when set, gets the first look at every plain-HTTP request,
+	// before the ForceHTTPS redirect. It returns true if it has answered the
+	// request, in which case no further handling happens.
+	//
+	// This exists because when the server obtains its own certificate over ACME
+	// while masquerading on port 80, the ACME HTTP-01 challenge server cannot
+	// bind that port — we are already on it. So the challenge has to be answered
+	// from here instead, or renewal can never succeed while the server is up.
+	// The hook is a plain func so this package stays free of an ACME dependency.
+	ACMEChallenge func(w http.ResponseWriter, r *http.Request) bool
 }
 
 func (s *MasqTCPServer) ListenAndServeHTTP(addr string) error {
-	return correctnet.HTTPListenAndServe(addr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return correctnet.HTTPListenAndServe(addr, s.httpHandler())
+}
+
+func (s *MasqTCPServer) httpHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Must come before the redirect below. A CA does follow the 301 to
+		// HTTPS, but it lands on the masquerade handler, which serves the
+		// decoy site and knows nothing about challenge tokens — so the
+		// challenge has to be answered here, on the request that arrives.
+		if s.ACMEChallenge != nil && s.ACMEChallenge(w, r) {
+			return
+		}
 		if s.ForceHTTPS {
 			if s.HTTPSPort == 0 || s.HTTPSPort == 443 {
 				// Omit port if it's the default
@@ -33,7 +54,7 @@ func (s *MasqTCPServer) ListenAndServeHTTP(addr string) error {
 			return
 		}
 		s.Handler.ServeHTTP(newAltSvcHijackResponseWriter(w, s.QUICPort), r)
-	}))
+	})
 }
 
 func (s *MasqTCPServer) ListenAndServeHTTPS(addr string) error {

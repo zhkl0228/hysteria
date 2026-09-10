@@ -34,6 +34,7 @@ import (
 	"github.com/libdns/njalla"
 	"github.com/libdns/porkbun"
 	"github.com/libdns/vultr/v2"
+	"github.com/mholt/acmez/v3"
 	"github.com/mholt/acmez/v3/acme"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -101,6 +102,10 @@ type serverConfig struct {
 	// echConfigList is the base64 ECHConfigList produced by fillTLSConfig, kept
 	// so fillTrafficLogger can serve it from the /ech endpoint.
 	echConfigList string
+	// acmeIssuer is set by fillTLSConfig when ACME is in use, so that
+	// fillMasqHandler can let it answer HTTP-01 challenges on port 80.
+	// nil when a local certificate is configured instead.
+	acmeIssuer *certmagic.ACMEIssuer
 }
 
 type serverConfigRealm struct {
@@ -1167,6 +1172,7 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 			return configError{Field: "acme.domains", Err: err}
 		}
 		hyConfig.TLSConfig.GetCertificate = cmCfg.GetCertificate
+		c.acmeIssuer = cmIssuer
 	}
 	if err := c.fillECHKeys(hyConfig); err != nil {
 		return err
@@ -1687,20 +1693,101 @@ func (c *serverConfig) fillMasqHandler(hyConfig *server.Config) error {
 		if c.Masquerade.ListenHTTP != "" && c.Masquerade.ListenHTTPS == "" {
 			return configError{Field: "masquerade.listenHTTPS", Err: errors.New("having only HTTP server without HTTPS is not supported")}
 		}
+		masqTLSConfig := &tls.Config{
+			Certificates:             hyConfig.TLSConfig.Certificates,
+			GetCertificate:           hyConfig.TLSConfig.GetCertificate,
+			EncryptedClientHelloKeys: hyConfig.TLSConfig.ECHKeys,
+		}
+		// Assigned after the config above is complete: the hook derives the
+		// challenge config from it, and must not capture itself.
+		masqTLSConfig.GetConfigForClient = c.acmeTLSALPNChallenge(masqTLSConfig)
 		s := masq.MasqTCPServer{
-			QUICPort:  extractPortFromAddr(hyConfig.Conn.LocalAddr().String()),
-			HTTPSPort: extractPortFromAddr(c.Masquerade.ListenHTTPS),
-			Handler:   &masqHandlerLogWrapper{H: handler, QUIC: false},
-			TLSConfig: &tls.Config{
-				Certificates:             hyConfig.TLSConfig.Certificates,
-				GetCertificate:           hyConfig.TLSConfig.GetCertificate,
-				EncryptedClientHelloKeys: hyConfig.TLSConfig.ECHKeys,
-			},
-			ForceHTTPS: c.Masquerade.ForceHTTPS,
+			QUICPort:      extractPortFromAddr(hyConfig.Conn.LocalAddr().String()),
+			HTTPSPort:     extractPortFromAddr(c.Masquerade.ListenHTTPS),
+			Handler:       &masqHandlerLogWrapper{H: handler, QUIC: false},
+			ACMEChallenge: c.acmeHTTPChallenge(),
+			TLSConfig:     masqTLSConfig,
+			ForceHTTPS:    c.Masquerade.ForceHTTPS,
 		}
 		go runMasqTCPServer(&s, c.Masquerade.ListenHTTP, c.Masquerade.ListenHTTPS)
 	}
 	return nil
+}
+
+// acmeHTTPChallenge returns the hook that lets the masquerade HTTP server on
+// port 80 answer ACME HTTP-01 challenges for this server's own certificate.
+// Returns nil when ACME is not in use, which leaves the hook unset.
+//
+// This is needed because certmagic's own challenge server cannot bind port 80
+// while the masquerade server holds it. certmagic does not treat that as an
+// error: robustTryListen returns no listener and no error, on the assumption
+// that whatever already occupies the port can answer the challenge. Nothing
+// did, so the CA reached the decoy site instead and validation failed — the
+// certificate could only ever be obtained during startup, in the window before
+// the masquerade server takes the port.
+//
+// The hook stays shut except while a challenge is actually in flight. certmagic
+// records a challenge in a process-global table when the solver presents it and
+// drops it during cleanup; GetACMEChallenge reports exactly that window. Outside
+// it every request falls through to the masquerade handler untouched, so the
+// challenge path is not observable on the decoy site between renewals.
+func (c *serverConfig) acmeHTTPChallenge() func(http.ResponseWriter, *http.Request) bool {
+	issuer := c.acmeIssuer
+	if issuer == nil {
+		return nil
+	}
+	return func(w http.ResponseWriter, r *http.Request) bool {
+		if !certmagic.LooksLikeHTTPChallenge(r) {
+			return false
+		}
+		// Check for a live challenge before handing the request over.
+		// HandleHTTPChallenge would otherwise fall back to a storage lookup and
+		// log a warning on every probe of /.well-known/acme-challenge/, which
+		// on a public masquerade host means scanner traffic filling the log.
+		// r.Host may carry a port; GetACMEChallenge strips it.
+		if _, ok := certmagic.GetACMEChallenge(r.Host); !ok {
+			return false
+		}
+		return issuer.HandleHTTPChallenge(w, r)
+	}
+}
+
+// acmeTLSALPNChallenge returns a GetConfigForClient hook that lets the
+// masquerade HTTPS server on port 443 answer ACME TLS-ALPN-01 challenges.
+// Returns nil when ACME is not in use, which leaves the hook unset.
+//
+// Serving the challenge certificate itself needs no work here: the masquerade
+// TLS config already gets its certificate from certmagic, which returns the
+// key authentication certificate when it sees an acme-tls/1 handshake. What
+// blocks the challenge is ALPN negotiation happening first — http.Server puts
+// h2 and http/1.1 in NextProtos, the CA offers only acme-tls/1, and Go rejects
+// the handshake for want of a shared protocol before any certificate is chosen.
+// So the only thing this hook does is swap in a config that speaks acme-tls/1.
+//
+// Like the HTTP-01 hook, it stays shut except while a challenge for that exact
+// name is in flight. Returning a nil config leaves the base config in force, so
+// outside the window an acme-tls/1 handshake is refused for no shared protocol,
+// exactly as it would be by an ordinary web server.
+func (c *serverConfig) acmeTLSALPNChallenge(base *tls.Config) func(*tls.ClientHelloInfo) (*tls.Config, error) {
+	if c.acmeIssuer == nil {
+		return nil
+	}
+	challengeConfig := base.Clone()
+	challengeConfig.NextProtos = []string{acmez.ACMETLS1Protocol}
+	return func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		// RFC 8737 section 3: the CA sends an ALPN extension holding the single
+		// protocol name acme-tls/1, and an SNI extension holding only the name
+		// being validated. Anything else is not a challenge and is left alone.
+		if hello.ServerName == "" ||
+			len(hello.SupportedProtos) != 1 ||
+			hello.SupportedProtos[0] != acmez.ACMETLS1Protocol {
+			return nil, nil
+		}
+		if _, ok := certmagic.GetACMEChallenge(hello.ServerName); !ok {
+			return nil, nil
+		}
+		return challengeConfig, nil
+	}
 }
 
 // Config validates the fields and returns a ready-to-use Hysteria server config
