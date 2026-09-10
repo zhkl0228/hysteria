@@ -1071,7 +1071,14 @@ func (c *serverConfig) fillTLSConfig(hyConfig *server.Config) error {
 			}
 			cmIssuer.ExternalAccount = eab
 		default:
-			return configError{Field: "acme.ca", Err: errors.New("unsupported CA")}
+			// Any https:// value is taken as an ACME directory URL, which is
+			// what reaching a CA other than the two named above requires:
+			// Let's Encrypt's staging endpoint, or a local test CA such as
+			// Pebble when verifying renewal behavior end to end.
+			if !strings.HasPrefix(strings.ToLower(c.ACME.CA), "https://") {
+				return configError{Field: "acme.ca", Err: errors.New("unsupported CA: expected letsencrypt, zerossl, or an https:// ACME directory URL")}
+			}
+			cmIssuer.CA = c.ACME.CA
 		}
 
 		switch strings.ToLower(c.ACME.Type) {
