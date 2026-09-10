@@ -33,6 +33,17 @@ ech:
   enabled: true
   publicName: cover.example.com
   keyPath: some_ech.pem
+  publish:
+    name: cloudflare
+    config:
+      cloudflare_api_token: ech_token
+    domains:
+      - sub1.example.com
+    zone: example.com
+    ttl: 10m
+    alpn:
+      - h3
+      - h2
 
 acme:
   domains:

@@ -66,6 +66,16 @@ func TestServerConfig(t *testing.T) {
 			Enabled:    &echEnabled,
 			PublicName: "cover.example.com",
 			KeyPath:    "some_ech.pem",
+			Publish: &serverConfigECHPublish{
+				Name: "cloudflare",
+				Config: map[string]string{
+					"cloudflare_api_token": "ech_token",
+				},
+				Domains: []string{"sub1.example.com"},
+				Zone:    "example.com",
+				TTL:     10 * time.Minute,
+				ALPN:    []string{"h3", "h2"},
+			},
 		},
 		ACME: &serverConfigACME{
 			Domains: []string{

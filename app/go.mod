@@ -14,6 +14,7 @@ require (
 	github.com/libdns/duckdns v0.3.0
 	github.com/libdns/gandi v1.1.0
 	github.com/libdns/godaddy v1.1.0
+	github.com/libdns/libdns v1.1.1
 	github.com/libdns/namecheap v1.0.0
 	github.com/libdns/njalla v0.0.0-20250815081032-a55a87a8f20f
 	github.com/libdns/porkbun v1.1.0
@@ -52,7 +53,6 @@ require (
 	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/koron/go-ssdp v0.0.4 // indirect
-	github.com/libdns/libdns v1.1.1 // indirect
 	github.com/libp2p/go-nat v1.0.1-0.20250821073202-01afc089f138 // indirect
 	github.com/libp2p/go-netroute v0.2.1 // indirect
 	github.com/miekg/dns v1.1.72 // indirect

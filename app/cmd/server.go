@@ -145,11 +145,37 @@ type serverConfigECH struct {
 	// Enabled is nil-as-true, so an `ech` block that only sets keyPath behaves
 	// exactly as upstream: present means on.
 	Enabled *bool `mapstructure:"enabled"`
-	// PublicName is the outer (cover) SNI. Only used when generating a key,
-	// i.e. when KeyPath does not exist yet.
+	// PublicName is the outer (cover) SNI, defaulting to
+	// defaultECHPublicName. Only used when generating a key, i.e. when
+	// KeyPath does not exist yet.
 	PublicName string `mapstructure:"publicName"`
 	// KeyPath defaults to ech.pem next to the config file.
 	KeyPath string `mapstructure:"keyPath"`
+	// Publish, when set, makes the server publish its ECH config list as an
+	// HTTPS record through a DNS provider. It is deliberately independent of
+	// acme.dns: the ACME challenge and this record are different jobs, and
+	// ACME is commonly solved over HTTP-01 with no DNS credentials at all.
+	Publish *serverConfigECHPublish `mapstructure:"publish"`
+}
+
+type serverConfigECHPublish struct {
+	// Name is the DNS provider. Optional, as "cloudflare" is the only
+	// supported value; see providerCloudflare.
+	Name string `mapstructure:"name"`
+	// Config holds the provider credentials, e.g. cloudflare_api_token.
+	Config map[string]string `mapstructure:"config"`
+	// Domains defaults to acme.domains.
+	Domains []string `mapstructure:"domains"`
+	// Zone is the zone apex the records belong to. Discovered by SOA lookup
+	// when empty.
+	Zone string `mapstructure:"zone"`
+	// TTL defaults to echPublishDefaultTTL.
+	TTL time.Duration `mapstructure:"ttl"`
+	// ALPN overrides the alpn= SvcParam of the record. Defaults to the
+	// protocols this server actually serves; see echPublishALPN. An explicit
+	// empty list publishes no alpn= at all, which leaves browsers reaching
+	// the masquerade site exactly as they do today.
+	ALPN []string `mapstructure:"alpn"`
 }
 
 type serverConfigACME struct {

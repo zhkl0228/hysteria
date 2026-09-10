@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
@@ -53,6 +54,24 @@ func TestServerConfigECHKeyPath(t *testing.T) {
 	}
 }
 
+func TestServerConfigECHPublicName(t *testing.T) {
+	tests := []struct {
+		name string
+		ech  *serverConfigECH
+		want string
+	}{
+		{"explicit name wins", &serverConfigECH{PublicName: "cover.example.com"}, "cover.example.com"},
+		{"defaults to the cloudflare crowd", &serverConfigECH{}, defaultECHPublicName},
+		{"no ech block", nil, defaultECHPublicName},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &serverConfig{ECH: tt.ech}
+			assert.Equal(t, tt.want, c.echPublicName())
+		})
+	}
+}
+
 func TestFillECHKeys(t *testing.T) {
 	logger = zap.NewNop()
 
@@ -96,7 +115,7 @@ func TestFillECHKeysDisabled(t *testing.T) {
 	assert.True(t, os.IsNotExist(err))
 }
 
-func TestFillECHKeysRequiresPublicName(t *testing.T) {
+func TestFillECHKeysDefaultsPublicName(t *testing.T) {
 	logger = zap.NewNop()
 
 	dir := t.TempDir()
@@ -104,11 +123,13 @@ func TestFillECHKeysRequiresPublicName(t *testing.T) {
 		ECH:       &serverConfigECH{Enabled: boolPtr(true)},
 		configDir: dir,
 	}
-	// Enabling ECH without a key file and without a public name must fail rather
-	// than pick a cover name on the user's behalf.
-	err := c.fillECHKeys(&server.Config{})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "ech")
+	// Enabling ECH without a key file and without a public name generates one
+	// under the default cover name.
+	require.NoError(t, c.fillECHKeys(&server.Config{}))
+	configList, err := base64.StdEncoding.DecodeString(c.echConfigList)
+	require.NoError(t, err)
+	// The public name is carried in the clear inside the ECHConfig.
+	assert.Contains(t, string(configList), defaultECHPublicName)
 }
 
 func TestFillECHKeysExistingFileNeedsNoPublicName(t *testing.T) {
