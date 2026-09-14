@@ -9,8 +9,7 @@ things on top:
 
 - **`ech.enabled`** with automatic key generation, so a server can turn ECH on
   without running an external tool first.
-- **`hysteria ech keygen`**, producing the same key file format as
-  `sing-box generate ech-keypair`.
+- A default public name, so `ech.enabled` alone is a complete config.
 - **`GET /ech`** on the trafficStats API, so clients can fetch the config list
   instead of having it copied out of the server log by hand.
 - **`ech.publish`**, which writes the config list into DNS as an HTTPS record,
@@ -84,13 +83,14 @@ Omitting the `ech` block, or setting `ech.enabled: false`, disables ECH.
 ### Generating a key manually
 
 ```
-hysteria ech keygen cover.example.com -o /etc/hysteria/ech.pem
+hysteria ech --public-name cover.example.com -o /etc/hysteria/ech.pem
 ```
 
-The public name argument is optional and defaults to `cloudflare-ech.com`. The
-command prints the base64 config list to give to clients. The file is
-interchangeable with `sing-box generate ech-keypair <public_name>` in both
-directions.
+This is upstream's command: `--public-name` is required there, and only the
+server's automatic generation (`ech.enabled` without a key file) applies the
+`cloudflare-ech.com` default. The command prints the base64 config list to give
+to clients. The file is interchangeable with
+`sing-box generate ech-keypair <public_name>` in both directions.
 
 ## Client config
 

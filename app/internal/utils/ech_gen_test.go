@@ -6,54 +6,6 @@ import (
 	"testing"
 )
 
-func TestGenerateECHKeyPEM(t *testing.T) {
-	const publicName = "cover.example.com"
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "ech.pem")
-
-	data, err := GenerateECHKeyPEM(publicName)
-	if err != nil {
-		t.Fatalf("GenerateECHKeyPEM: %v", err)
-	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	// The generated file must be readable by the loader that upstream uses for
-	// sing-box keys, which is the whole point of matching its format.
-	keys, configList, err := LoadECHKeys(path)
-	if err != nil {
-		t.Fatalf("LoadECHKeys on generated file: %v", err)
-	}
-	if len(keys) != 1 {
-		t.Fatalf("expected 1 key, got %d", len(keys))
-	}
-	if !keys[0].SendAsRetry {
-		t.Error("expected SendAsRetry to be set")
-	}
-	// The ECH CONFIGS block we wrote must match the list derived from the keys.
-	if blob := findPEMBlock(data, pemBlockECHConfigs); !equalBytes(blob, configList) {
-		t.Errorf("CONFIGS block and derived config list differ:\n got %x\nwant %x", blob, configList)
-	}
-
-	// End-to-end against crypto/tls: a real handshake must accept ECH.
-	assertECHHandshake(t, keys, configList, true)
-}
-
-func TestGenerateECHKeyPEMErrors(t *testing.T) {
-	if _, err := GenerateECHKeyPEM(""); err == nil {
-		t.Error("expected error for empty public name")
-	}
-	long := make([]byte, 256)
-	for i := range long {
-		long[i] = 'a'
-	}
-	if _, err := GenerateECHKeyPEM(string(long)); err == nil {
-		t.Error("expected error for over-long public name")
-	}
-}
-
 func TestEnsureECHKeys(t *testing.T) {
 	const publicName = "cover.example.com"
 
