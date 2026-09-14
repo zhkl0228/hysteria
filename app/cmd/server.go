@@ -102,6 +102,9 @@ type serverConfig struct {
 	// echConfigList is the base64 ECHConfigList produced by fillTLSConfig, kept
 	// so fillTrafficLogger can serve it from the /ech endpoint.
 	echConfigList string
+	// echPublishStatus is where the background DNS publishing reports its
+	// outcome, nil unless ech.publish is configured. Served by /ech.
+	echPublishStatus *trafficlogger.ECHPublishStatus
 	// acmeIssuer is set by fillTLSConfig when ACME is in use, so that
 	// fillMasqHandler can let it answer HTTP-01 challenges on port 80.
 	// nil when a local certificate is configured instead.
@@ -1576,8 +1579,10 @@ func (c *serverConfig) fillTrafficLogger(hyConfig *server.Config) error {
 		puo, _ := hyConfig.OutboundProvider.(*outbounds.PerUserOutbounds)
 		tss := trafficlogger.NewTrafficStatsServerWithOutbounds(c.TrafficStats.Secret, puo)
 		// Serve the ECH config list from /ech so clients can fetch it instead of
-		// having it copied out of the server log by hand.
+		// having it copied out of the server log by hand, along with whether
+		// publishing it to DNS worked.
 		tss.SetECH(c.echConfigList)
+		tss.SetECHPublish(c.echPublishStatus)
 		hyConfig.TrafficLogger = tss
 		go runTrafficStatsServer(c.TrafficStats.Listen, tss)
 	}

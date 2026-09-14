@@ -12,6 +12,8 @@ import (
 	"github.com/libdns/cloudflare"
 	"github.com/libdns/libdns"
 	"go.uber.org/zap"
+
+	"github.com/apernet/hysteria/extras/v2/trafficlogger"
 )
 
 // Publishing the ECH config list to DNS.
@@ -64,21 +66,22 @@ func (c *serverConfig) validateECHPublish() ([]string, error) {
 }
 
 // publishECHConfig writes an HTTPS record carrying configList to the DNS
-// provider configured under ech.publish, one record per domain.
+// provider configured under ech.publish, one record per domain, and records
+// each outcome in status for the /ech endpoint.
 //
 // It runs in the background and never fails the server: the record is a
 // convenience for clients that discover ECH configs over DNS, and a DNS API
 // that is down or slow is no reason to refuse connections. Every failure is
 // logged with the record we tried to write, so it can be published by hand.
 // Domains are independent - one failing does not skip the rest.
-func (c *serverConfig) publishECHConfig(domains []string, configList []byte) {
+func (c *serverConfig) publishECHConfig(status *trafficlogger.ECHPublishStatus, domains []string, configList []byte) {
 	provider := &cloudflare.Provider{APIToken: c.ECH.Publish.Config["cloudflare_api_token"]}
 	for _, domain := range domains {
-		c.publishECHConfigForDomain(provider, domain, configList)
+		c.publishECHConfigForDomain(status, provider, domain, configList)
 	}
 }
 
-func (c *serverConfig) publishECHConfigForDomain(provider *cloudflare.Provider, domain string, configList []byte) {
+func (c *serverConfig) publishECHConfigForDomain(status *trafficlogger.ECHPublishStatus, provider *cloudflare.Provider, domain string, configList []byte) {
 	ctx, cancel := context.WithTimeout(context.Background(), echPublishTimeout)
 	defer cancel()
 
@@ -87,6 +90,7 @@ func (c *serverConfig) publishECHConfigForDomain(provider *cloudflare.Provider, 
 		logger.Error("failed to publish the ECH config list to DNS",
 			zap.String("domain", domain),
 			zap.Error(err))
+		status.Failed(domain)
 		return
 	}
 	rec := c.echPublishRecord(domain, zone, configList)
@@ -98,6 +102,7 @@ func (c *serverConfig) publishECHConfigForDomain(provider *cloudflare.Provider, 
 			zap.String("type", rr.Type),
 			zap.String("data", rr.Data),
 			zap.Error(err))
+		status.Failed(domain)
 		return
 	}
 	logger.Info("published the ECH config list to DNS",
@@ -105,6 +110,7 @@ func (c *serverConfig) publishECHConfigForDomain(provider *cloudflare.Provider, 
 		zap.String("name", rr.Name),
 		zap.String("type", rr.Type),
 		zap.String("data", rr.Data))
+	status.Published(domain)
 }
 
 // echPublishRecord builds the HTTPS record that carries configList for domain.

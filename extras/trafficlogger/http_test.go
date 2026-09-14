@@ -81,26 +81,41 @@ func TestECHEndpoint(t *testing.T) {
 
 	srv := NewTrafficStatsServer(testSecret)
 
-	// ECH not configured: the endpoint stays hidden.
-	rec := doReq(t, srv, http.MethodGet, "/ech", testSecret, "")
-	assert.Equal(t, http.StatusNotFound, rec.Code)
-
-	srv.SetECH(configList)
-
 	// Still requires the secret, same as every other endpoint.
-	rec = doReq(t, srv, http.MethodGet, "/ech", "", "")
+	rec := doReq(t, srv, http.MethodGet, "/ech", "", "")
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 
+	// ECH not configured: says so, nothing else.
 	rec = doReq(t, srv, http.MethodGet, "/ech", testSecret, "")
 	require.Equal(t, http.StatusOK, rec.Code)
-	var resp struct {
-		Config string `json:"config"`
-	}
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
-	assert.Equal(t, configList, resp.Config)
+	assert.JSONEq(t, `{"enabled": false}`, rec.Body.String())
 
-	// Clearing it hides the endpoint again.
+	// Enabled without ech.publish: "publish" is null, so a client can tell
+	// "not configured" from "not published yet".
+	srv.SetECH(configList)
+	rec = doReq(t, srv, http.MethodGet, "/ech", testSecret, "")
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.JSONEq(t, `{"enabled": true, "config": "`+configList+`", "publish": null}`, rec.Body.String())
+
+	// With ech.publish, the folded publishing state rides along, live.
+	status := NewECHPublishStatus([]string{"a.example.com", "b.example.com"})
+	srv.SetECHPublish(status)
+	rec = doReq(t, srv, http.MethodGet, "/ech", testSecret, "")
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.JSONEq(t, `{"enabled": true, "config": "`+configList+`", "publish": "pending"}`, rec.Body.String())
+
+	status.Published("a.example.com")
+	status.Published("b.example.com")
+	rec = doReq(t, srv, http.MethodGet, "/ech", testSecret, "")
+	assert.JSONEq(t, `{"enabled": true, "config": "`+configList+`", "publish": "published"}`, rec.Body.String())
+
+	status.Failed("b.example.com")
+	rec = doReq(t, srv, http.MethodGet, "/ech", testSecret, "")
+	assert.JSONEq(t, `{"enabled": true, "config": "`+configList+`", "publish": "failed"}`, rec.Body.String())
+
+	// Clearing the config list reports disabled again.
 	srv.SetECH("")
 	rec = doReq(t, srv, http.MethodGet, "/ech", testSecret, "")
-	assert.Equal(t, http.StatusNotFound, rec.Code)
+	require.Equal(t, http.StatusOK, rec.Code)
+	assert.JSONEq(t, `{"enabled": false}`, rec.Body.String())
 }

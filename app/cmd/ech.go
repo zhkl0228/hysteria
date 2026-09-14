@@ -11,6 +11,7 @@ import (
 
 	"github.com/apernet/hysteria/app/v2/internal/utils"
 	"github.com/apernet/hysteria/core/v2/server"
+	"github.com/apernet/hysteria/extras/v2/trafficlogger"
 )
 
 // defaultECHKeyFile is the ECH key file name used when ech.keyPath is unset.
@@ -58,8 +59,8 @@ func (c *serverConfig) echKeyPath() string {
 }
 
 // fillECHKeys installs the server's ECH keys, generating and persisting a key
-// pair on first run. It also records the config list so fillTrafficLogger can
-// serve it from /ech.
+// pair on first run. It also records the config list, and the status of
+// publishing it to DNS, so fillTrafficLogger can serve both from /ech.
 func (c *serverConfig) fillECHKeys(hyConfig *server.Config) error {
 	if !c.echEnabled() {
 		return nil
@@ -86,8 +87,11 @@ func (c *serverConfig) fillECHKeys(hyConfig *server.Config) error {
 		}
 		// Publishing is a side errand: it talks to a third-party DNS API and
 		// only helps clients that look ECH configs up in DNS, so it must not
-		// hold up - or take down - the server.
-		go c.publishECHConfig(domains, configList)
+		// hold up - or take down - the server. Its outcome is still worth
+		// knowing without grepping the log, so it reports into a status
+		// that /ech serves.
+		c.echPublishStatus = trafficlogger.NewECHPublishStatus(domains)
+		go c.publishECHConfig(c.echPublishStatus, domains, configList)
 	}
 	return nil
 }

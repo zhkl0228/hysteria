@@ -27,8 +27,13 @@ type TrafficStatsServer interface {
 
 	// SetECH sets the base64-encoded ECHConfigList served by the /ech endpoint,
 	// so clients can fetch the server's ECH config instead of having it copied
-	// out of the server log by hand. An empty string disables the endpoint.
+	// out of the server log by hand. An empty string means ECH is disabled.
 	SetECH(configList string)
+
+	// SetECHPublish attaches the status of publishing the config list to DNS,
+	// reported as the "publish" field of /ech. nil, the default, means
+	// ech.publish is not configured and the field is null.
+	SetECHPublish(status *ECHPublishStatus)
 }
 
 func NewTrafficStatsServer(secret string) TrafficStatsServer {
@@ -63,12 +68,22 @@ type trafficStatsServerImpl struct {
 	// echConfigList is the base64-encoded ECHConfigList served by /ech.
 	// Guarded by Mutex.
 	echConfigList string
+	// echPublish is the DNS publishing status reported by /ech, nil when
+	// ech.publish is not configured. Guarded by Mutex; its contents have
+	// their own lock.
+	echPublish *ECHPublishStatus
 }
 
 func (s *trafficStatsServerImpl) SetECH(configList string) {
 	s.Mutex.Lock()
 	defer s.Mutex.Unlock()
 	s.echConfigList = configList
+}
+
+func (s *trafficStatsServerImpl) SetECHPublish(status *ECHPublishStatus) {
+	s.Mutex.Lock()
+	defer s.Mutex.Unlock()
+	s.echPublish = status
 }
 
 type trafficStatsEntry struct {
@@ -401,21 +416,37 @@ func (s *trafficStatsServerImpl) getDumpStreams(w http.ResponseWriter, r *http.R
 	}
 }
 
-// getECH returns the server's base64-encoded ECHConfigList, which clients put in
-// their tls.ech field. Returns 404 when ECH is not enabled.
+// getECH reports whether ECH is enabled, and if so the server's base64-encoded
+// ECHConfigList, which clients put in their tls.ech field, plus the state of
+// publishing it to DNS when ech.publish is configured.
 func (s *trafficStatsServerImpl) getECH(w http.ResponseWriter, r *http.Request) {
 	s.Mutex.RLock()
 	configList := s.echConfigList
+	publish := s.echPublish
 	s.Mutex.RUnlock()
 
+	var resp any
 	if configList == "" {
-		http.NotFound(w, r)
-		return
+		// Disabled: nothing else applies, so nothing else is reported.
+		resp = struct {
+			Enabled bool `json:"enabled"`
+		}{false}
+	} else {
+		// Publish is null rather than absent when ech.publish is not
+		// configured, so an enabled server always has the key.
+		var state *ECHPublishState
+		if publish != nil {
+			st := publish.State()
+			state = &st
+		}
+		resp = struct {
+			Enabled bool             `json:"enabled"`
+			Config  string           `json:"config"`
+			Publish *ECHPublishState `json:"publish"`
+		}{true, configList, state}
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	err := json.NewEncoder(w).Encode(&struct {
-		Config string `json:"config"`
-	}{configList})
+	err := json.NewEncoder(w).Encode(resp)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}

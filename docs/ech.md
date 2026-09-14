@@ -132,11 +132,15 @@ With `trafficStats.listen` configured, the server exposes:
 GET /ech
 Authorization: <trafficStats.secret>
 
-{"config":"AEv+DQBHAAAgACB3rc0Q..."}
+{"enabled":true,"config":"AEv+DQBHAAAgACB3rc0Q...","publish":"published"}
 ```
 
-It returns 404 when ECH is disabled. The same value is printed to the server log
-at startup.
+`enabled` says whether ECH is on; when it is off the response is just
+`{"enabled":false}`. `config` is the same value printed to the server log at
+startup. `publish` is `null` unless `ech.publish` is configured (see below),
+then `pending` until the background attempt finishes, then `published`, or
+`failed` when any domain could not be written — the server log has the record
+and the reason.
 
 ## Publishing the config list to DNS
 
@@ -205,6 +209,9 @@ above, and `ech.publish` is off unless configured.
   Mistakes that can be caught without touching the network — an unknown provider,
   a missing token, a wildcard domain — are config errors and still fail at
   startup.
+- The outcome is also reported as `publish` by `GET /ech` on the trafficStats
+  API (see above), so a deploy script or a monitor can check that the record
+  landed without reading the log.
 - The record is rewritten on every start, so rotating `ech.pem` propagates on the
   next restart. Clients holding the previous list recover through the retry
   configs described below in the meantime.
