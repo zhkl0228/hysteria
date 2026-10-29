@@ -6,8 +6,19 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"time"
 
 	"github.com/apernet/hysteria/extras/v2/correctnet"
+)
+
+// Timeouts for both masquerade servers. Without them a peer that connects and then goes quiet holds its
+// connection forever. ReadHeaderTimeout also bounds the TLS handshake (net/http uses the smallest of
+// ReadHeaderTimeout, ReadTimeout and WriteTimeout as the handshake deadline). That matters when the HTTPS
+// server is the dest of an xray REALITY inbound: REALITY dials us before it has read the Client Hello and
+// has no deadline of its own, so this is what releases the pair when the client never finishes it.
+const (
+	masqReadHeaderTimeout = 30 * time.Second
+	masqIdleTimeout       = 120 * time.Second
 )
 
 // MasqTCPServer covers the TCP parts of a standard web server (TCP based HTTP/HTTPS).
@@ -32,7 +43,18 @@ type MasqTCPServer struct {
 }
 
 func (s *MasqTCPServer) ListenAndServeHTTP(addr string) error {
-	return correctnet.HTTPListenAndServe(addr, s.httpHandler())
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           s.httpHandler(),
+		ReadHeaderTimeout: masqReadHeaderTimeout,
+		IdleTimeout:       masqIdleTimeout,
+	}
+	listener, err := correctnet.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	return server.Serve(listener)
 }
 
 func (s *MasqTCPServer) httpHandler() http.Handler {
@@ -63,7 +85,9 @@ func (s *MasqTCPServer) ListenAndServeHTTPS(addr string) error {
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			s.Handler.ServeHTTP(newAltSvcHijackResponseWriter(w, s.QUICPort), r)
 		}),
-		TLSConfig: s.TLSConfig,
+		TLSConfig:         s.TLSConfig,
+		ReadHeaderTimeout: masqReadHeaderTimeout,
+		IdleTimeout:       masqIdleTimeout,
 	}
 	listener, err := correctnet.Listen("tcp", addr)
 	if err != nil {
